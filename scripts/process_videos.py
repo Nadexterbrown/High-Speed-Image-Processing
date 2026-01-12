@@ -1004,6 +1004,8 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
             print(f"  Background scalar: {background_scalar}")
             print(f"  Centerline noise (from frame 0): mean={centerline_noise_mean:.1f}, std={centerline_noise_std:.1f}, max={centerline_noise_max:.1f}")
             print(f"  Centerline flame threshold: {centerline_flame_threshold:.1f}")
+            print(f"  Image width: {video.width} px")
+            print(f"  Flame exit threshold: {int(video.width * 0.99)} px (99% of width)")
 
             # Generate paper-style stacked sequence visualization
             # Select frames to display (e.g., every 10th frame, or specific range)
@@ -1116,40 +1118,30 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
                     # Use prior position as current (flame is at least where it was)
                     pixel_pos = None
 
-            # Check for flame exiting domain using frame difference peak location
-            # This is more robust than relying on detection failure
-            flame_exited = False
-            if frame_diff is not None and prior_flame_pos is not None:
-                diff_centerline = frame_diff[center_row, :]
-                diff_peak_idx = int(np.argmax(diff_centerline))
-                diff_peak_val = float(diff_centerline[diff_peak_idx])
+            # Check for flame exiting domain
+            # Simple check: if detected position reaches the end of the domain, flame has left
+            domain_end_threshold = video.width - 10  # Last 10 pixels
 
-                # Flame is exiting if:
-                # 1. Peak is near right edge (within 5% of domain width)
-                # 2. There's significant signal (above noise threshold)
-                right_edge_threshold = video.width * 0.95
-                if diff_peak_idx >= right_edge_threshold and diff_peak_val > centerline_flame_threshold:
-                    print(f"[Rank {rank}] Flame exiting domain at frame {frame_idx}")
-                    print(f"  Frame diff peak at {diff_peak_idx}/{video.width} pixels (intensity={diff_peak_val:.1f})")
+            if pixel_pos is not None and pixel_pos >= domain_end_threshold:
+                print(f"[Rank {rank}] *** FLAME EXITED *** at frame {frame_idx}")
+                print(f"  pixel_pos={pixel_pos} >= {domain_end_threshold} (width={video.width})")
 
-                    # Use peak position as final flame position
-                    pixel_pos = diff_peak_idx
-                    pos_m = pixel_pos * file_calibration + file_position_offset
-                    local_results.append((frame_idx, time_s, pixel_pos, pos_m))
-                    flame_exited = True
+                # Record final position and stop
+                pos_m = pixel_pos * file_calibration + file_position_offset
+                local_results.append((frame_idx, time_s, pixel_pos, pos_m))
 
-                    # Save this final frame
-                    save_frame_image(
-                        frame=frame,
-                        frame_subtracted=frame_subtracted,
-                        frame_diff=frame_diff,
-                        flame_position=pixel_pos,
-                        frame_idx=frame_idx,
-                        time_s=time_s,
-                        output_path=frames_output_dir,
-                        source_name=config.name
-                    )
-                    break
+                # Save this final frame
+                save_frame_image(
+                    frame=frame,
+                    frame_subtracted=frame_subtracted,
+                    frame_diff=frame_diff,
+                    flame_position=pixel_pos,
+                    frame_idx=frame_idx,
+                    time_s=time_s,
+                    output_path=frames_output_dir,
+                    source_name=config.name
+                )
+                break  # EXIT THE LOOP
 
             if pixel_pos is not None:
                 pos_m = pixel_pos * file_calibration + file_position_offset
@@ -1191,6 +1183,43 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
         # Write results (root only)
         if is_root and flat_results:
+            # Post-process: truncate results after flame exits domain
+            # This handles MPI case where different ranks may process frames past exit
+            domain_end_threshold = video.width - 10
+            exit_frame_idx = None
+
+            for i, (frame_idx, time_s, pixel_pos, pos_m) in enumerate(flat_results):
+                if pixel_pos >= domain_end_threshold:
+                    exit_frame_idx = i
+                    print(f"  Flame exited at frame {frame_idx} (position {pixel_pos} >= {domain_end_threshold})")
+                    break
+
+            # Truncate results to include only up to and including the exit frame
+            if exit_frame_idx is not None:
+                # Get the exit frame number to clean up images
+                exit_frame_num = flat_results[exit_frame_idx][0]
+
+                flat_results = flat_results[:exit_frame_idx + 1]
+                print(f"  Truncated results to {len(flat_results)} frames (removed frames after exit)")
+
+                # Delete frame images past the exit frame
+                import glob
+                frame_pattern = str(frames_output_dir / f"{config.name}-Frame-*.png")
+                all_frame_images = glob.glob(frame_pattern)
+                deleted_count = 0
+                for img_path in all_frame_images:
+                    # Extract frame number from filename (e.g., "Nova-Frame-000144.png" -> 144)
+                    try:
+                        fname = os.path.basename(img_path)
+                        frame_num = int(fname.split('-Frame-')[1].split('.')[0])
+                        if frame_num > exit_frame_num:
+                            os.remove(img_path)
+                            deleted_count += 1
+                    except (ValueError, IndexError):
+                        pass
+                if deleted_count > 0:
+                    print(f"  Deleted {deleted_count} frame images past exit frame {exit_frame_num}")
+
             for frame_idx, time_s, pixel_pos, pos_m in flat_results:
                 results['#Frame'].append(frame_idx)
                 results['Time_s'].append(f"{time_s:.9f}")
@@ -1221,13 +1250,19 @@ def main():
     # Configure video sources
     nova_config = VideoSourceConfig(name="Nova")
     nova_config.enabled = True
-    nova_config.calibration = 0.00074074  # meters per pixel (default)
-    nova_config.position_offset = 0.0  # meters (default)
     nova_config.use_frame_diff = True  # Enable prior frame subtraction for flame isolation
     nova_config.detection_method = "half_maximum"  # Options: "threshold", "gradient", "half_maximum"
     nova_config.use_absolute_time = True  # Use absolute time from recording start
-    nova_config.video_path = "./Video-Files"
+    nova_config.video_path = "./Nova-Video-Files"
     nova_config.output_dir = "./Processed-Photos/Nova-Output"
+
+    mini_config = VideoSourceConfig(name="Mini")
+    mini_config.enabled = True
+    mini_config.use_frame_diff = True  # Enable prior frame subtraction for flame isolation
+    mini_config.detection_method = "threshold"  # Use threshold for Mini - half_max fails due to strong signal behind flame
+    mini_config.use_absolute_time = True  # Use absolute time from recording start
+    mini_config.video_path = "./Mini-Video-Files"
+    mini_config.output_dir = "./Processed-Photos/Mini-Output"
 
     # Per-file calibration and position offset
     nova_config.file_calibrations = [
@@ -1248,9 +1283,20 @@ def main():
         ),
     ]
 
+    mini_config.file_calibrations = [
+        FileCalibration(
+            calibration=0.000869565,
+            position_offset=0.050237,
+            files=["run-1-:run-10-"]
+        ),
+    ]
+
     # Process enabled sources
     if nova_config.enabled:
         process_video_source(nova_config, processor)
+
+    if mini_config.enabled:
+        process_video_source(mini_config, processor)
 
     # Synchronize before exit
     if processor is not None:
