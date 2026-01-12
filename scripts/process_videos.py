@@ -12,11 +12,12 @@ Usage:
 import os
 import sys
 import csv
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -44,16 +45,73 @@ except ImportError:
 ########################################################################################################################
 
 @dataclass
+class FileCalibration:
+    """
+    Calibration settings for specific files or file ranges.
+
+    Use 'files' to specify which files this calibration applies to.
+    Supports:
+    - Exact filenames: "Run-001.cihx"
+    - Partial matches: "Run-001" (matches any file containing this string)
+    - Range patterns: "Run-001:Run-005" (matches Run-001 through Run-005)
+
+    Example:
+        # Runs 1-3 with calibration A
+        FileCalibration(calibration=0.00074, position_offset=0.0, files=["Run-001:Run-003"])
+
+        # Runs 4-10 with calibration B and offset
+        FileCalibration(calibration=0.00080, position_offset=0.05, files=["Run-004:Run-010"])
+    """
+    calibration: float  # meters per pixel
+    position_offset: float = 0.0  # position offset in meters (added to detected position)
+    files: List[str] = field(default_factory=list)  # file patterns, names, or ranges
+
+    def matches(self, filename: str) -> bool:
+        """Check if this calibration applies to the given filename."""
+        for pattern in self.files:
+            # Check for range pattern (e.g., "Run-001:Run-005")
+            if ':' in pattern:
+                start, end = pattern.split(':', 1)
+                if self._matches_range(filename, start.strip(), end.strip()):
+                    return True
+            # Check for exact or partial match
+            elif pattern in filename:
+                return True
+        return False
+
+    def _matches_range(self, filename: str, start: str, end: str) -> bool:
+        """Check if filename falls within a range pattern."""
+        # Extract numeric portions for comparison
+        start_nums = re.findall(r'\d+', start)
+        end_nums = re.findall(r'\d+', end)
+        file_nums = re.findall(r'\d+', filename)
+
+        if not start_nums or not end_nums or not file_nums:
+            return False
+
+        # Use the last number found (typically the run number)
+        try:
+            start_num = int(start_nums[-1])
+            end_num = int(end_nums[-1])
+            file_num = int(file_nums[-1])
+            return start_num <= file_num <= end_num
+        except ValueError:
+            return False
+
+
+@dataclass
 class VideoSourceConfig:
     """Configuration for a video source."""
     name: str
     enabled: bool = False
-    calibration: float = 1.0  # meters per pixel
+    calibration: float = 1.0  # meters per pixel (default, used if no file-specific calibration)
+    position_offset: float = 0.0  # position offset in meters (default)
     trigger_frame: Optional[int] = None  # Frame index where trigger occurred. None = use metadata/absolute time
     use_frame_diff: bool = True  # Use prior frame subtraction for flame isolation
     detection_method: str = "half_maximum"  # "threshold", "gradient", or "half_maximum"
     use_absolute_time: bool = True  # Use absolute time from recording start (not trigger-relative)
     skip_frames: List[int] = field(default_factory=list)  # Frames to skip (no centerline detection)
+    file_calibrations: List[FileCalibration] = field(default_factory=list)  # Per-file calibration settings
 
     _video_path: Optional[str] = field(default=None, init=False, repr=False)
     _output_dir: Optional[str] = field(default=None, init=False, repr=False)
@@ -82,6 +140,24 @@ class VideoSourceConfig:
         else:
             base_path = Path(__file__).parent.parent
             return str((base_path / path).resolve())
+
+    def get_calibration_for_file(self, filename: str) -> Tuple[float, float]:
+        """
+        Get calibration and position offset for a specific file.
+
+        Checks file_calibrations list for matching patterns/ranges.
+        Falls back to default calibration and position_offset if no match.
+
+        Args:
+            filename: Name of the video file (e.g., "Run-005.cihx")
+
+        Returns:
+            Tuple of (calibration, position_offset) in meters
+        """
+        for fc in self.file_calibrations:
+            if fc.matches(filename):
+                return (fc.calibration, fc.position_offset)
+        return (self.calibration, self.position_offset)
 
 
 ########################################################################################################################
@@ -838,7 +914,10 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
         print(f"\n{'='*60}")
         print(f"Processing: {config.name}")
         print(f"Video path: {config.video_path}")
-        print(f"Calibration: {config.calibration} m/pixel")
+        print(f"Default calibration: {config.calibration} m/pixel")
+        print(f"Default position offset: {config.position_offset} m")
+        if config.file_calibrations:
+            print(f"File-specific calibrations: {len(config.file_calibrations)} rules defined")
         print(f"{'='*60}")
 
     # Find all CIHX files in the video path
@@ -852,15 +931,19 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
     # Process each video file
     for cihx_file in sorted(cihx_files):
+        # Get per-file calibration and position offset
+        file_calibration, file_position_offset = config.get_calibration_for_file(cihx_file.name)
+
         if is_root:
             print(f"\nLoading: {cihx_file.name}")
+            print(f"  Using calibration: {file_calibration} m/pixel, offset: {file_position_offset} m")
 
-        # Load video with calibration
+        # Load video with file-specific calibration
         video = open_video(
             str(cihx_file),
             trigger_frame=config.trigger_frame,
             calibration=SpatialCalibration(
-                scale=config.calibration,
+                scale=file_calibration,
                 units='m'
             )
         )
@@ -911,9 +994,11 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
             centerline_noise_max * 2.0
         )
 
-        # Create output directory early (needed for stacked sequence output)
+        # Create output directories
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        frames_output_dir = output_dir / f"{cihx_file.stem}-frames"
+        frames_output_dir.mkdir(parents=True, exist_ok=True)
 
         if is_root:
             print(f"  Background scalar: {background_scalar}")
@@ -929,23 +1014,23 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
             print(f"  Generating stacked sequence with frames: {display_frames}")
 
-            # Two-column version (BG subtracted + frame diff)
+            # Two-column version (BG subtracted + frame diff) - save in frames folder
             generate_stacked_sequence(
                 video=video,
                 frame_indices=display_frames,
                 background_scalar=background_scalar,
-                output_path=output_dir / f"{cihx_file.stem}-stacked-sequence.png",
+                output_path=frames_output_dir / f"{cihx_file.stem}-stacked-sequence.png",
                 title=f"{cihx_file.stem}",
                 show_frame_diff=True,
                 figsize_width=12.0
             )
 
-            # Single column version (just BG subtracted)
+            # Single column version (just BG subtracted) - save in frames folder
             generate_stacked_sequence_single_column(
                 video=video,
                 frame_indices=display_frames,
                 background_scalar=background_scalar,
-                output_path=output_dir / f"{cihx_file.stem}-stacked-single.png",
+                output_path=frames_output_dir / f"{cihx_file.stem}-stacked-single.png",
                 use_frame_diff=False,
                 title=f"{cihx_file.stem}",
                 figsize_width=8.0
@@ -967,10 +1052,6 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
         local_results = []
         flame_exited = False
-
-        # Create frames output directory
-        frames_output_dir = output_dir / f"{cihx_file.stem}-frames"
-        frames_output_dir.mkdir(parents=True, exist_ok=True)
 
         prior_frame = None
         prior_flame_pos = None  # Track previous flame position for velocity check
@@ -1053,7 +1134,7 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
                     # Use peak position as final flame position
                     pixel_pos = diff_peak_idx
-                    pos_m = pixel_pos * config.calibration
+                    pos_m = pixel_pos * file_calibration + file_position_offset
                     local_results.append((frame_idx, time_s, pixel_pos, pos_m))
                     flame_exited = True
 
@@ -1071,7 +1152,7 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
                     break
 
             if pixel_pos is not None:
-                pos_m = pixel_pos * config.calibration
+                pos_m = pixel_pos * file_calibration + file_position_offset
                 local_results.append((frame_idx, time_s, pixel_pos, pos_m))
                 prior_flame_pos = pixel_pos  # Update for next iteration
 
@@ -1140,13 +1221,32 @@ def main():
     # Configure video sources
     nova_config = VideoSourceConfig(name="Nova")
     nova_config.enabled = True
-    nova_config.calibration = 0.00074074  # meters per pixel
+    nova_config.calibration = 0.00074074  # meters per pixel (default)
+    nova_config.position_offset = 0.0  # meters (default)
     nova_config.use_frame_diff = True  # Enable prior frame subtraction for flame isolation
     nova_config.detection_method = "half_maximum"  # Options: "threshold", "gradient", "half_maximum"
     nova_config.use_absolute_time = True  # Use absolute time from recording start
-    # nova_config.skip_frames = [90]  # Manual skip no longer needed - automatic detection handles this
     nova_config.video_path = "./Video-Files"
     nova_config.output_dir = "./Processed-Photos/Nova-Output"
+
+    # Per-file calibration and position offset
+    nova_config.file_calibrations = [
+        FileCalibration(
+            calibration=0.000833333,
+            position_offset=1.0159,
+            files=["run-1-"]
+        ),
+        FileCalibration(
+            calibration=0.000833333,
+            position_offset=1.197565,
+            files=["run-2-"]
+        ),
+        FileCalibration(
+            calibration=0.000833333,
+            position_offset=1.347567,
+            files=["run-3-:run-10-"]
+        ),
+    ]
 
     # Process enabled sources
     if nova_config.enabled:
