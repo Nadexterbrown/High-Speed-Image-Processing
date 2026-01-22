@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
+from scipy.ndimage import gaussian_filter, grey_opening, sobel
+from scipy.interpolate import UnivariateSpline
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -108,9 +110,8 @@ class VideoSourceConfig:
     position_offset: float = 0.0  # position offset in meters (default)
     trigger_frame: Optional[int] = None  # Frame index where trigger occurred. None = use metadata/absolute time
     use_frame_diff: bool = True  # Use prior frame subtraction for flame isolation
-    detection_method: str = "half_maximum"  # "threshold", "gradient", or "half_maximum"
     use_absolute_time: bool = True  # Use absolute time from recording start (not trigger-relative)
-    skip_frames: List[int] = field(default_factory=list)  # Frames to skip (no centerline detection)
+    skip_frames: List[int] = field(default_factory=list)  # Frames to skip
     file_calibrations: List[FileCalibration] = field(default_factory=list)  # Per-file calibration settings
 
     _video_path: Optional[str] = field(default=None, init=False, repr=False)
@@ -158,6 +159,508 @@ class VideoSourceConfig:
             if fc.matches(filename):
                 return (fc.calibration, fc.position_offset)
         return (self.calibration, self.position_offset)
+
+
+@dataclass
+class FlameDetectorConfig:
+    """Configuration for flame front detection algorithm."""
+
+    # Preprocessing parameters (applied in order: frame_diff -> noise_removal -> blur)
+    frame_diff_threshold: float = 5.0        # Threshold for frame differencing
+    morphology_kernel_size: int = 3          # Kernel size for morphological opening (noise removal)
+    gaussian_sigma: float = 1.5              # Gaussian blur sigma (1-2 recommended)
+
+    # Detection parameters
+    min_gradient_strength: float = 10.0      # Minimum gradient magnitude to consider valid
+    edge_margin_px: int = 10                 # Margin from image edges to ignore
+    sobel_threshold_fraction: float = 0.1    # Fraction of max Sobel value for "rightmost" detection
+
+    # Tracking constraints
+    max_velocity_change_m_s: float = 200.0   # Maximum velocity change between frames (m/s)
+
+    # DDT detection
+    ddt_velocity_jump_m_s: float = 1250.0    # Velocity jump threshold to detect DDT (m/s)
+
+    # Spline estimator parameters
+    use_spline_estimator: bool = True        # Use spline for position prediction
+    spline_smoothing: float = 0.5            # Spline smoothing factor (0=interpolate, higher=smoother)
+    min_points_for_spline: int = 5           # Minimum points before using spline
+
+    # Search window
+    search_window_px: int = 100              # Search window half-width around predicted position
+
+    # Domain exit
+    exit_margin_px: int = 15                 # Stop when position >= width - exit_margin_px
+
+
+@dataclass
+class FlameDetectionResult:
+    """Results from a single frame's flame detection."""
+    frame_idx: int
+    time_s: float
+
+    # Processing step outputs (for visualization)
+    frame_subtracted: np.ndarray          # Background-subtracted frame
+    frame_diff: Optional[np.ndarray]      # Step 1: current - prior
+    noise_removed: Optional[np.ndarray]   # Step 2: morphological opening on diff
+    blurred: Optional[np.ndarray]         # Step 3: Gaussian blur
+    sobel_output: Optional[np.ndarray]    # Step 4a: Sobel filter
+    gradient_output: Optional[np.ndarray] # Step 4b: np.gradient filter
+
+    # Detection results
+    pos_min_gradient: Optional[int]       # Position from minimum gradient
+    pos_rightmost_sobel: Optional[int]    # Position from rightmost Sobel
+    pos_spline_predicted: Optional[int]   # Position from spline estimator
+    search_bounds: Optional[Tuple[int, int]]  # Velocity-constrained search bounds
+
+    # Final selected position
+    final_position: Optional[int]
+
+
+class FlameDetector:
+    """
+    Flame front detection with velocity-constrained tracking.
+
+    Processing pipeline (in order):
+    1. Subtract prior frame from current frame (isolate new flame region)
+    2. Remove isolated pixels (morphological opening on diff)
+    3. Apply Gaussian blur to smooth
+    4. Apply Sobel filter AND gradient filter (separately)
+    5. Find position by: (a) min gradient, (b) rightmost Sobel
+    6. Compare with spline estimator prediction bounded by velocity
+    """
+
+    def __init__(
+        self,
+        config: FlameDetectorConfig,
+        frame_rate: float,
+        calibration_m_per_px: float
+    ):
+        """
+        Initialize flame detector.
+
+        Args:
+            config: Detection configuration parameters
+            frame_rate: Video frame rate in fps
+            calibration_m_per_px: Spatial calibration (meters per pixel)
+        """
+        self.config = config
+        self.frame_rate = frame_rate
+        self.calibration = calibration_m_per_px
+
+        # Tracking state
+        self._position_history: List[Tuple[int, Optional[int]]] = []
+        # Velocity history: (frame_idx, v_backward1, v_backward2, v_central)
+        # v_backward1: first-order backward difference (current method)
+        # v_backward2: second-order backward difference
+        # v_central: second-order central difference (for prior time point)
+        self._velocity_history: List[Tuple[int, float, Optional[float], Optional[float]]] = []
+        self._prior_frame: Optional[np.ndarray] = None  # BG-subtracted prior frame
+        self._spline: Optional[UnivariateSpline] = None
+
+        # DDT detection
+        self._ddt_frame_idx: Optional[int] = None  # Frame where DDT was detected
+
+        # Store all detection results for plotting
+        self._detection_results: List[FlameDetectionResult] = []
+
+        # Precompute max pixel displacement per frame
+        self._max_displacement_px = self._compute_max_displacement()
+
+    def _compute_max_displacement(self) -> int:
+        """Compute maximum allowed pixel displacement between frames."""
+        if self.frame_rate <= 0 or self.calibration <= 0:
+            return 1000  # No constraint if parameters unknown
+        dt = 1.0 / self.frame_rate
+        max_displacement_m = self.config.max_velocity_change_m_s * dt
+        return int(np.ceil(max_displacement_m / self.calibration)) + 1
+
+    def reset(self) -> None:
+        """Reset tracking state for a new video."""
+        self._position_history.clear()
+        self._velocity_history.clear()
+        self._detection_results.clear()
+        self._prior_frame = None
+        self._spline = None
+        self._ddt_frame_idx = None
+
+    def _update_spline(self) -> None:
+        """Update spline estimator with current position history."""
+        valid_points = [(f, p) for f, p in self._position_history if p is not None]
+        if len(valid_points) < self.config.min_points_for_spline:
+            self._spline = None
+            return
+
+        frames = np.array([f for f, p in valid_points])
+        positions = np.array([p for f, p in valid_points])
+
+        try:
+            # Use smoothing spline - higher s = smoother
+            self._spline = UnivariateSpline(
+                frames, positions,
+                s=self.config.spline_smoothing * len(frames),
+                k=min(3, len(frames) - 1)  # Cubic or lower if not enough points
+            )
+        except Exception:
+            self._spline = None
+
+    def predict_with_spline(self, frame_idx: int) -> Optional[int]:
+        """Predict position using spline estimator."""
+        if self._spline is None:
+            return None
+        try:
+            predicted = int(self._spline(frame_idx))
+            return max(0, predicted)
+        except Exception:
+            return None
+
+    def get_search_bounds(self, frame_idx: int, width: int) -> Tuple[int, int]:
+        """
+        Get velocity-constrained search bounds for this frame.
+
+        Returns:
+            (search_start, search_end) pixel positions
+        """
+        margin = self.config.edge_margin_px
+
+        # Get last known position
+        last_position = None
+        last_frame_idx = None
+        for f_idx, pos in reversed(self._position_history):
+            if pos is not None:
+                last_position = pos
+                last_frame_idx = f_idx
+                break
+
+        if last_position is None:
+            # No history - search full width
+            return (margin, width - margin)
+
+        # Compute bounds based on max velocity
+        frames_elapsed = frame_idx - last_frame_idx
+        max_displacement = self._max_displacement_px * max(1, frames_elapsed)
+
+        # Flame only moves right, so search_start = last_position
+        # search_end = last_position + max_displacement
+        search_start = last_position
+        search_end = min(width - margin, last_position + max_displacement + self.config.search_window_px)
+
+        return (search_start, search_end)
+
+    def detect(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        background_scalar: float
+    ) -> FlameDetectionResult:
+        """
+        Main detection entry point with full pipeline.
+
+        Processing steps:
+        1. Subtract prior frame from current (isolate new flame region)
+        2. Remove isolated pixels (morphological opening)
+        3. Gaussian blur to smooth
+        4. Apply Sobel filter AND gradient filter
+        5. Find position by min gradient AND rightmost Sobel
+        6. Compare with spline prediction
+
+        Args:
+            frame: Raw frame data
+            frame_idx: Frame index
+            background_scalar: Background value for subtraction
+
+        Returns:
+            FlameDetectionResult with all intermediate outputs
+        """
+        height, width = frame.shape[:2]
+        center_row = height // 2
+        time_s = frame_idx / self.frame_rate if self.frame_rate > 0 else 0
+
+        # Background subtraction (always done first)
+        frame_subtracted = subtract_scalar_background(frame, background_scalar)
+
+        # Get search bounds from velocity constraint
+        search_start, search_end = self.get_search_bounds(frame_idx, width)
+
+        # Initialize outputs
+        frame_diff = None
+        noise_removed = None
+        blurred = None
+        sobel_output = None
+        gradient_output = None
+        pos_min_gradient = None
+        pos_rightmost_sobel = None
+        pos_spline_predicted = None
+
+        # ========== STEP 1: Frame Differencing ==========
+        # Subtract prior frame from current to isolate new flame region
+        if self._prior_frame is not None:
+            frame_diff = frame_subtracted.astype(np.float64) - self._prior_frame.astype(np.float64)
+            frame_diff[frame_diff < self.config.frame_diff_threshold] = 0
+
+            # ========== STEP 2: Remove Isolated Pixels ==========
+            # Morphological opening on the frame difference to remove noise
+            kernel_size = self.config.morphology_kernel_size
+            noise_removed = grey_opening(frame_diff, size=(kernel_size, kernel_size))
+
+            # ========== STEP 3: Gaussian Blur ==========
+            blurred = gaussian_filter(noise_removed, sigma=self.config.gaussian_sigma)
+
+            # ========== STEP 4a: Sobel Filter ==========
+            sobel_output = sobel(blurred, axis=1)  # Horizontal gradient
+
+            # ========== STEP 4b: Gradient Filter (np.gradient) ==========
+            gradient_output = np.gradient(blurred, axis=1)
+
+            # ========== STEP 5: Find Flame Position ==========
+            # Extract centerline profiles in search region
+            sobel_line = sobel_output[center_row, :]
+            gradient_line = gradient_output[center_row, :]
+
+            # Constrain to search bounds
+            search_sobel = sobel_line[search_start:search_end]
+            search_gradient = gradient_line[search_start:search_end]
+
+            if len(search_sobel) > 0 and len(search_gradient) > 0:
+                # Method A: Minimum gradient location (most negative = leading edge)
+                # The leading edge has a DROP in intensity (negative gradient)
+                min_grad_val = np.min(search_gradient)
+                if min_grad_val < -self.config.min_gradient_strength:
+                    min_grad_idx = np.argmin(search_gradient)
+                    pos_min_gradient = search_start + min_grad_idx
+
+                # Method B: Rightmost position in Sobel above threshold
+                # Find the rightmost significant edge (positive or negative Sobel)
+                sobel_max = np.max(np.abs(search_sobel))
+                if sobel_max > self.config.min_gradient_strength:
+                    threshold = sobel_max * self.config.sobel_threshold_fraction
+                    above_thresh = np.abs(search_sobel) > threshold
+                    if np.any(above_thresh):
+                        rightmost_idx = np.max(np.where(above_thresh)[0])
+                        pos_rightmost_sobel = search_start + rightmost_idx
+
+        # ========== STEP 6: Spline Estimator Prediction ==========
+        if self.config.use_spline_estimator:
+            pos_spline_predicted = self.predict_with_spline(frame_idx)
+
+        # ========== SELECT FINAL POSITION ==========
+        # Use the rightmost detected position (this is the leading edge for left-to-right propagation)
+        # Trust the Sobel/gradient detection - don't override with velocity constraints
+        final_position = None
+
+        # Collect all valid candidates from detection methods
+        candidates = []
+        if pos_min_gradient is not None:
+            candidates.append(('min_gradient', pos_min_gradient))
+        if pos_rightmost_sobel is not None:
+            candidates.append(('rightmost_sobel', pos_rightmost_sobel))
+
+        # Select the RIGHTMOST candidate (flame front is at the right edge)
+        if candidates:
+            # Sort by position (descending) and pick the rightmost
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_method, candidate = candidates[0]
+
+            # USE THE DETECTED POSITION DIRECTLY - trust Sobel/gradient over velocity prediction
+            final_position = candidate
+
+        # ========== UPDATE STATE ==========
+        self._position_history.append((frame_idx, final_position))
+        self._prior_frame = frame_subtracted.copy()
+
+        # Update spline
+        self._update_spline()
+
+        # Update velocity history and detect DDT
+        # Calculate three velocity methods:
+        # 1) First-order backward: v_n = (x_n - x_{n-1}) / dt
+        # 2) Second-order backward: v_n = (3*x_n - 4*x_{n-1} + x_{n-2}) / (2*dt)
+        # 3) Second-order central: v_{n-1} = (x_n - x_{n-2}) / (2*dt)
+        if final_position is not None and len(self._position_history) >= 2:
+            curr_frame, curr_pos = self._position_history[-1]  # Current (just added)
+            prev_frame, prev_pos = self._position_history[-2]  # Previous
+
+            if prev_pos is not None and self.frame_rate > 0:
+                dt = (curr_frame - prev_frame) / self.frame_rate
+                if dt > 0:
+                    # 1) First-order backward difference (current method)
+                    v_backward1 = (curr_pos - prev_pos) * self.calibration / dt
+
+                    # 2) Second-order backward difference (needs 3 points)
+                    v_backward2: Optional[float] = None
+                    if len(self._position_history) >= 3:
+                        prev2_frame, prev2_pos = self._position_history[-3]
+                        if prev2_pos is not None:
+                            # Assuming uniform time steps
+                            v_backward2 = (3*curr_pos - 4*prev_pos + prev2_pos) * self.calibration / (2*dt)
+
+                    # 3) Second-order central difference (for prior time point)
+                    # v_{n-1} = (x_n - x_{n-2}) / (2*dt)
+                    v_central: Optional[float] = None
+                    if len(self._position_history) >= 3:
+                        prev2_frame, prev2_pos = self._position_history[-3]
+                        if prev2_pos is not None:
+                            v_central = (curr_pos - prev2_pos) * self.calibration / (2*dt)
+                            # Update the previous velocity entry with central difference
+                            if len(self._velocity_history) >= 1:
+                                old_entry = self._velocity_history[-1]
+                                self._velocity_history[-1] = (old_entry[0], old_entry[1], old_entry[2], v_central)
+
+                    self._velocity_history.append((frame_idx, v_backward1, v_backward2, None))
+
+                    # Detect DDT: velocity jump > threshold (using first-order backward)
+                    if self._ddt_frame_idx is None and len(self._velocity_history) >= 2:
+                        prev_vel = self._velocity_history[-2][1]  # First-order backward from prev
+                        velocity_jump = v_backward1 - prev_vel
+                        if velocity_jump > self.config.ddt_velocity_jump_m_s:
+                            self._ddt_frame_idx = frame_idx
+
+        # Build result
+        result = FlameDetectionResult(
+            frame_idx=frame_idx,
+            time_s=time_s,
+            frame_subtracted=frame_subtracted,
+            frame_diff=frame_diff,
+            noise_removed=noise_removed,
+            blurred=blurred,
+            sobel_output=sobel_output,
+            gradient_output=gradient_output,
+            pos_min_gradient=pos_min_gradient,
+            pos_rightmost_sobel=pos_rightmost_sobel,
+            pos_spline_predicted=pos_spline_predicted,
+            search_bounds=(search_start, search_end),
+            final_position=final_position
+        )
+
+        self._detection_results.append(result)
+        return result
+
+    def _validate_position(
+        self,
+        candidate_position: int,
+        frame_idx: int
+    ) -> Optional[int]:
+        """Validate position against tracking constraints."""
+        # Get last known valid position
+        last_position = None
+        last_frame_idx = None
+        for f_idx, pos in reversed(self._position_history):
+            if pos is not None:
+                last_position = pos
+                last_frame_idx = f_idx
+                break
+
+        if last_position is None:
+            return candidate_position
+
+        # Constraint 1: Non-negative velocity (position can only increase)
+        if candidate_position < last_position:
+            return None
+
+        # Constraint 2: Maximum velocity
+        frames_elapsed = frame_idx - last_frame_idx
+        if frames_elapsed > 0:
+            max_displacement = self._max_displacement_px * frames_elapsed
+            actual_displacement = candidate_position - last_position
+            if actual_displacement > max_displacement:
+                return last_position + max_displacement
+
+        return candidate_position
+
+    def get_spline_curve(self, frame_range: Optional[Tuple[int, int]] = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Get spline curve for plotting.
+
+        Args:
+            frame_range: Optional (start, end) frame range
+
+        Returns:
+            (frames, positions) arrays for plotting, or None if no spline
+        """
+        if self._spline is None:
+            return None
+
+        valid_points = [(f, p) for f, p in self._position_history if p is not None]
+        if not valid_points:
+            return None
+
+        if frame_range is None:
+            f_min = min(f for f, _ in valid_points)
+            f_max = max(f for f, _ in valid_points)
+        else:
+            f_min, f_max = frame_range
+
+        frames = np.linspace(f_min, f_max, 100)
+        try:
+            positions = self._spline(frames)
+            return frames, positions
+        except Exception:
+            return None
+
+    @property
+    def position_history(self) -> List[Tuple[int, Optional[int]]]:
+        """Get position history."""
+        return self._position_history
+
+    @property
+    def last_position(self) -> Optional[int]:
+        """Get last detected position."""
+        for _, pos in reversed(self._position_history):
+            if pos is not None:
+                return pos
+        return None
+
+    @property
+    def last_velocity(self) -> Optional[float]:
+        """Get last computed velocity (first-order backward) in m/s."""
+        if self._velocity_history:
+            return self._velocity_history[-1][1]  # First-order backward
+        return None
+
+    @property
+    def last_velocities(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Get last computed velocities (v_backward1, v_backward2, v_central) in m/s."""
+        if self._velocity_history:
+            entry = self._velocity_history[-1]
+            return (entry[1], entry[2], entry[3])
+        return (None, None, None)
+
+    @property
+    def ddt_frame(self) -> Optional[int]:
+        """Get frame index where DDT was detected, or None if not detected."""
+        return self._ddt_frame_idx
+
+    @property
+    def ddt_detected(self) -> bool:
+        """Check if DDT has been detected."""
+        return self._ddt_frame_idx is not None
+
+    def get_velocity_history(self) -> List[Tuple[int, float, Optional[float], Optional[float]]]:
+        """Get full velocity history with all three methods."""
+        return list(self._velocity_history)
+
+    def get_pre_ddt_velocities(self) -> List[Tuple[int, float, Optional[float], Optional[float]]]:
+        """Get velocity history before DDT."""
+        if self._ddt_frame_idx is None:
+            return list(self._velocity_history)
+        return [entry for entry in self._velocity_history if entry[0] < self._ddt_frame_idx]
+
+    def get_post_ddt_velocities(self) -> List[Tuple[int, float, Optional[float], Optional[float]]]:
+        """Get velocity history after DDT (including DDT frame)."""
+        if self._ddt_frame_idx is None:
+            return []
+        return [entry for entry in self._velocity_history if entry[0] >= self._ddt_frame_idx]
+
+    def clear_last_central_difference(self) -> None:
+        """Clear the central difference from the second-to-last velocity entry.
+
+        Called when flame exits domain - the central difference for frame n-1
+        was computed using x_n which is invalid (at edge), so we must clear it.
+        """
+        if len(self._velocity_history) >= 2:
+            entry = self._velocity_history[-2]
+            # Set v_central (index 3) to None
+            self._velocity_history[-2] = (entry[0], entry[1], entry[2], None)
 
 
 ########################################################################################################################
@@ -260,281 +763,6 @@ def is_empty_frame(
     return signal_fraction < min_signal_fraction
 
 
-def detect_rightmost_flame_edge(
-    row: np.ndarray,
-    threshold: float = 5.0,
-    min_region_size: int = 3
-) -> Optional[int]:
-    """
-    Detect rightmost flame edge by finding the rightmost edge of the main flame region.
-
-    Uses adaptive thresholding and contiguous region detection to avoid
-    detecting noise at image edges.
-
-    Args:
-        row: 1D array of pixel intensities along centerline
-        threshold: Minimum absolute intensity threshold for detection
-        min_region_size: Minimum number of consecutive pixels to be considered a valid region
-
-    Returns:
-        Pixel index of rightmost flame edge, or None if not detected
-    """
-    # Use adaptive threshold: max of fixed threshold and percentage of row max
-    row_max = np.max(row)
-    adaptive_threshold = max(threshold, row_max * 0.05)  # At least 5% of max intensity
-
-    above_thresh = row > adaptive_threshold
-
-    if not np.any(above_thresh):
-        return None
-
-    # Find contiguous regions above threshold
-    # Detect transitions: 0->1 (start) and 1->0 (end)
-    padded = np.concatenate([[False], above_thresh, [False]])
-    starts = np.where(padded[:-1] < padded[1:])[0]
-    ends = np.where(padded[:-1] > padded[1:])[0]
-
-    if len(starts) == 0:
-        return None
-
-    # Find the largest contiguous region (most likely the actual flame)
-    region_sizes = ends - starts
-    valid_regions = region_sizes >= min_region_size
-
-    if not np.any(valid_regions):
-        # No region large enough, fall back to largest region
-        largest_idx = np.argmax(region_sizes)
-        return int(ends[largest_idx] - 1)
-
-    # Among valid regions, find the one with highest total intensity (the real flame)
-    best_region_idx = None
-    best_intensity = 0
-
-    for i in range(len(starts)):
-        if valid_regions[i]:
-            region_intensity = np.sum(row[starts[i]:ends[i]])
-            if region_intensity > best_intensity:
-                best_intensity = region_intensity
-                best_region_idx = i
-
-    if best_region_idx is None:
-        return None
-
-    # Return rightmost edge of the best region
-    return int(ends[best_region_idx] - 1)
-
-
-def detect_flame_edge_gradient(
-    row: np.ndarray,
-    smooth_window: int = 5,
-    min_gradient: float = 1.0
-) -> Optional[int]:
-    """
-    Detect flame edge using maximum gradient (derivative) method.
-
-    Finds the steepest intensity DROP on the RIGHT side of the peak,
-    which corresponds to the leading edge of a flame front propagating rightward.
-
-    Args:
-        row: 1D array of pixel intensities along centerline
-        smooth_window: Window size for smoothing before gradient calculation
-        min_gradient: Minimum gradient magnitude to consider valid
-
-    Returns:
-        Pixel index of flame edge (steepest drop location), or None if not detected
-    """
-    if len(row) < smooth_window + 2:
-        return None
-
-    # Smooth the signal to reduce noise
-    if smooth_window > 1:
-        kernel = np.ones(smooth_window) / smooth_window
-        smoothed = np.convolve(row, kernel, mode='same')
-    else:
-        smoothed = row.astype(np.float64)
-
-    # Find the peak location first
-    peak_idx = np.argmax(smoothed)
-    peak_val = smoothed[peak_idx]
-
-    if peak_val < min_gradient * 10:
-        return None
-
-    # Compute gradient (forward difference)
-    gradient = np.diff(smoothed)
-
-    # Only look at gradient to the RIGHT of the peak (falling edge / leading edge of flame)
-    # We want the steepest negative gradient (biggest drop) after the peak
-    if peak_idx >= len(gradient):
-        return None
-
-    right_gradient = gradient[peak_idx:]
-
-    if len(right_gradient) == 0:
-        return None
-
-    # Find the steepest descent (most negative gradient) on the right side
-    min_grad_local_idx = np.argmin(right_gradient)
-    min_grad_val = right_gradient[min_grad_local_idx]
-
-    # Check if the gradient is significant enough
-    if abs(min_grad_val) < min_gradient:
-        return None
-
-    # Convert back to global index
-    edge_idx = peak_idx + min_grad_local_idx
-
-    return int(edge_idx)
-
-
-def detect_flame_edge_half_maximum(
-    row: np.ndarray,
-    smooth_window: int = 5
-) -> Optional[int]:
-    """
-    Detect flame edge using half-maximum method.
-
-    Finds where intensity drops to 50% of peak value on the trailing edge
-    (right side) of the flame. This is a standard physics method for edge detection.
-
-    Args:
-        row: 1D array of pixel intensities along centerline
-        smooth_window: Window size for smoothing
-
-    Returns:
-        Pixel index where intensity crosses half-maximum, or None if not detected
-    """
-    if len(row) < smooth_window + 2:
-        return None
-
-    # Smooth the signal
-    if smooth_window > 1:
-        kernel = np.ones(smooth_window) / smooth_window
-        smoothed = np.convolve(row, kernel, mode='same')
-    else:
-        smoothed = row.astype(np.float64)
-
-    # Find the peak
-    peak_idx = np.argmax(smoothed)
-    peak_val = smoothed[peak_idx]
-
-    if peak_val < 10:  # No significant signal
-        return None
-
-    # Calculate half-maximum value
-    # Use local baseline (minimum near the right side) for better accuracy
-    right_region = smoothed[peak_idx:]
-    if len(right_region) < 5:
-        return None
-
-    baseline = np.min(right_region[-min(50, len(right_region)):])  # Baseline from far right
-    half_max = baseline + (peak_val - baseline) * 0.5
-
-    # Find where intensity crosses half-maximum on the RIGHT side of peak
-    right_side = smoothed[peak_idx:]
-
-    # Find first crossing below half-max
-    below_half = right_side < half_max
-
-    if not np.any(below_half):
-        return None
-
-    # Find the first index where we go below half-max
-    first_below = np.argmax(below_half)
-
-    if first_below == 0:
-        # Already below at peak, something's wrong
-        return None
-
-    # Interpolate for sub-pixel accuracy
-    idx_above = peak_idx + first_below - 1
-    idx_below = peak_idx + first_below
-
-    if idx_below >= len(smoothed):
-        return int(idx_above)
-
-    # Linear interpolation
-    val_above = smoothed[idx_above]
-    val_below = smoothed[idx_below]
-
-    if val_above == val_below:
-        return int(idx_above)
-
-    fraction = (val_above - half_max) / (val_above - val_below)
-    edge_position = idx_above + fraction
-
-    return int(round(edge_position))
-
-
-def detect_flame_edge(
-    row: np.ndarray,
-    method: str = "half_maximum",
-    **kwargs
-) -> Optional[int]:
-    """
-    Unified flame edge detection with selectable method.
-
-    Args:
-        row: 1D array of pixel intensities along centerline
-        method: Detection method - "threshold", "gradient", or "half_maximum"
-        **kwargs: Additional arguments passed to the specific method
-
-    Returns:
-        Pixel index of flame edge, or None if not detected
-    """
-    if method == "threshold":
-        return detect_rightmost_flame_edge(row, **kwargs)
-    elif method == "gradient":
-        return detect_flame_edge_gradient(row, **kwargs)
-    elif method == "half_maximum":
-        return detect_flame_edge_half_maximum(row, **kwargs)
-    else:
-        raise ValueError(f"Unknown detection method: {method}")
-
-
-def process_frame(
-    frame: np.ndarray,
-    background_scalar: float,
-    calibration: float,
-    prior_frame: Optional[np.ndarray] = None,
-    use_frame_diff: bool = False
-) -> Tuple[Optional[int], Optional[float], np.ndarray]:
-    """
-    Process a single frame to detect flame position.
-
-    Args:
-        frame: Frame data as numpy array
-        background_scalar: Background value to subtract
-        calibration: Meters per pixel
-        prior_frame: Optional previous frame for frame differencing
-        use_frame_diff: If True, combine background subtraction with frame differencing
-
-    Returns:
-        Tuple of (pixel_position, position_in_meters, processed_image)
-    """
-    # Background subtraction
-    img_subtracted = subtract_scalar_background(frame, background_scalar)
-
-    # Optionally combine with prior frame differencing
-    if use_frame_diff and prior_frame is not None:
-        frame_diff = subtract_prior_frame(frame, prior_frame, threshold=10.0)
-        # Combine: use frame diff to enhance the moving flame front
-        img_processed = img_subtracted * (frame_diff > 0).astype(float) + frame_diff * 0.5
-        img_processed = np.clip(img_processed, 0, None)
-    else:
-        img_processed = img_subtracted
-
-    # Detect flame edge at center row
-    center_row = img_processed.shape[0] // 2
-    pixel_idx = detect_rightmost_flame_edge(img_processed[center_row, :])
-
-    if pixel_idx is not None:
-        position_m = pixel_idx * calibration
-        return pixel_idx, position_m, img_processed
-
-    return None, None, img_processed
-
-
 def write_results(output_dict: dict, path: str) -> str:
     """Write results to space-delimited text file."""
     csv.register_dialect('gnuplot_spaces', delimiter=' ', skipinitialspace=True)
@@ -554,133 +782,328 @@ def write_results(output_dict: dict, path: str) -> str:
 
 def save_frame_image(
     frame: np.ndarray,
-    frame_subtracted: np.ndarray,
-    frame_diff: Optional[np.ndarray],
-    flame_position: Optional[int],
-    frame_idx: int,
-    time_s: float,
+    result: FlameDetectionResult,
     output_path: Path,
-    source_name: str
+    source_name: str,
+    detector: Optional['FlameDetector'] = None
 ) -> None:
     """
-    Save frame image with flame location marker and centerline intensity plot.
+    Save frame image showing all processing steps VERTICALLY stacked.
+
+    Layout (11 rows x 1 column):
+    1. BG-Subtracted frame
+    2. Frame Diff (current - prior)
+    3. Noise Removed (morphological opening)
+    4. Gaussian Blur
+    5. Sobel Filter
+    6. Gradient Filter (np.gradient)
+    7. Frame Diff centerline profile
+    8. Sobel centerline profile
+    9. Gradient centerline profile
+    10. Result overlay with all candidates
+    11. Position history + spline estimator
 
     Args:
         frame: Original frame data
-        frame_subtracted: Background-subtracted frame
-        frame_diff: Frame difference image (can be None)
-        flame_position: Detected flame position in pixels (x-coordinate)
-        frame_idx: Frame index
-        time_s: Time in seconds
+        result: FlameDetectionResult with all processing outputs
         output_path: Output directory path
         source_name: Name of video source for filename
+        detector: Optional FlameDetector for spline curve
     """
-    center_row = frame.shape[0] // 2
     height, width = frame.shape[:2]
-
-    # Create figure with 4 rows: original, BG subtracted, frame diff, centerline intensity
-    n_image_rows = 3 if frame_diff is not None else 2
-
-    fig = plt.figure(figsize=(12, 10))
-
-    # Use GridSpec for flexible layout
-    if frame_diff is not None:
-        gs = fig.add_gridspec(4, 1, height_ratios=[1, 1, 1, 0.8], hspace=0.3)
-    else:
-        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 0.8], hspace=0.3)
-
-    # Original frame
-    ax0 = fig.add_subplot(gs[0])
-    ax0.imshow(frame, cmap='gray', aspect='equal')
-    ax0.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
-    ax0.set_title(f'Original - Frame {frame_idx}')
-    ax0.set_xlabel('X (pixels)')
-    ax0.set_ylabel('Y (pixels)')
-
-    # Background-subtracted frame with flame marker
-    ax1 = fig.add_subplot(gs[1])
-    ax1.imshow(frame_subtracted, cmap='gray', aspect='equal')
-    ax1.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
-
-    if flame_position is not None:
-        ax1.plot(flame_position, center_row, 'ro', markersize=8, markeredgecolor='yellow', markeredgewidth=1)
-        ax1.set_title(f'BG Subtracted | t={time_s*1e6:.1f} µs | x={flame_position} px')
-    else:
-        ax1.set_title(f'BG Subtracted | t={time_s*1e6:.1f} µs | No detection')
-
-    ax1.set_xlabel('X (pixels)')
-    ax1.set_ylabel('Y (pixels)')
-
-    # Frame difference (if available)
-    if frame_diff is not None:
-        ax2 = fig.add_subplot(gs[2])
-        ax2.imshow(frame_diff, cmap='hot', aspect='equal')
-        ax2.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
-
-        if flame_position is not None:
-            ax2.plot(flame_position, center_row, 'go', markersize=8, markeredgecolor='white', markeredgewidth=1)
-
-        ax2.set_title(f'Frame Difference (motion)')
-        ax2.set_xlabel('X (pixels)')
-        ax2.set_ylabel('Y (pixels)')
-
-        intensity_ax_idx = 3
-    else:
-        intensity_ax_idx = 2
-
-    # Centerline intensity plot
-    ax_intensity = fig.add_subplot(gs[intensity_ax_idx])
-
-    # Extract centerline profiles
+    center_row = height // 2
     x_pixels = np.arange(width)
-    centerline_original = frame[center_row, :]
-    centerline_subtracted = frame_subtracted[center_row, :]
 
-    ax_intensity.plot(x_pixels, centerline_original, 'b-', label='Original', alpha=0.5, linewidth=1)
-    ax_intensity.plot(x_pixels, centerline_subtracted, 'k-', label='BG Subtracted', linewidth=1.5)
+    # Calculate aspect ratio for images (they're typically wide and short)
+    img_aspect = width / height
+    img_height = 1.5  # Height in inches for image subplots
+    plot_height = 2.5  # Height in inches for line plots
 
-    if frame_diff is not None:
-        centerline_diff = frame_diff[center_row, :]
-        ax_intensity.plot(x_pixels, centerline_diff, 'r-', label='Frame Diff', linewidth=1.5)
+    # Total figure height: 6 images + 6 plots
+    total_height = 6 * img_height + 6 * plot_height
+    fig_width = 14
 
-    # Show all detection methods for comparison
-    if frame_diff is not None:
-        # Run all detection methods and show results
-        pos_threshold = detect_rightmost_flame_edge(centerline_diff)
-        pos_gradient = detect_flame_edge_gradient(centerline_diff)
-        pos_half_max = detect_flame_edge_half_maximum(centerline_diff)
+    # Create figure with 12 rows, using GridSpec for variable heights
+    fig = plt.figure(figsize=(fig_width, total_height))
 
-        # Mark each method with different colors
-        if pos_threshold is not None:
-            ax_intensity.axvline(x=pos_threshold, color='red', linestyle=':', linewidth=1.5,
-                               label=f'Threshold: {pos_threshold} px', alpha=0.7)
-        if pos_gradient is not None:
-            ax_intensity.axvline(x=pos_gradient, color='blue', linestyle='-.', linewidth=1.5,
-                               label=f'Gradient: {pos_gradient} px', alpha=0.7)
-        if pos_half_max is not None:
-            ax_intensity.axvline(x=pos_half_max, color='green', linestyle='--', linewidth=2,
-                               label=f'Half-max: {pos_half_max} px')
+    # Define height ratios: images get less height, plots get more
+    height_ratios = [
+        img_height,   # 1. BG-Subtracted
+        img_height,   # 2. Frame Diff
+        img_height,   # 3. Noise Removed
+        img_height,   # 4. Gaussian Blur
+        img_height,   # 5. Sobel Filter
+        img_height,   # 6. Gradient Filter
+        plot_height,  # 7. Frame Diff centerline
+        plot_height,  # 8. Sobel centerline
+        plot_height,  # 9. Gradient centerline
+        img_height,   # 10. Result overlay
+        plot_height,  # 11. Position history
+        plot_height,  # 12. Velocity history
+    ]
+    gs = fig.add_gridspec(12, 1, height_ratios=height_ratios, hspace=0.3)
+    axes = [fig.add_subplot(gs[i, 0]) for i in range(12)]
 
-        # Highlight the selected method (flame_position)
-        if flame_position is not None:
-            ax_intensity.axvline(x=flame_position, color='magenta', linestyle='-', linewidth=2.5,
-                               label=f'Selected: {flame_position} px', alpha=0.5)
-    elif flame_position is not None:
-        ax_intensity.axvline(x=flame_position, color='green', linestyle='--', linewidth=2,
-                           label=f'Flame @ {flame_position} px')
+    # Helper function to add detection markers on images
+    def add_position_markers(ax, show_final=True):
+        if result.search_bounds:
+            ax.axvline(x=result.search_bounds[0], color='lime', linestyle='--', linewidth=1.5, alpha=0.8)
+            ax.axvline(x=result.search_bounds[1], color='lime', linestyle=':', linewidth=1.5, alpha=0.8)
+        if result.pos_min_gradient is not None:
+            ax.axvline(x=result.pos_min_gradient, color='purple', linestyle='-', linewidth=2, alpha=0.7)
+        if result.pos_rightmost_sobel is not None:
+            ax.axvline(x=result.pos_rightmost_sobel, color='orange', linestyle='-', linewidth=2, alpha=0.7)
+        if show_final and result.final_position is not None:
+            ax.axvline(x=result.final_position, color='red', linestyle='-', linewidth=3, alpha=0.9)
 
-    ax_intensity.set_xlabel('X (pixels)')
-    ax_intensity.set_ylabel('Intensity')
-    ax_intensity.set_title('Centerline Intensity Profile (Frame Diff)')
-    ax_intensity.legend(loc='upper right', fontsize=8)
-    ax_intensity.set_xlim(0, width)
-    ax_intensity.grid(True, alpha=0.3)
+    # Get velocity from detector
+    velocity_str = ""
+    if detector is not None and detector.last_velocity is not None:
+        velocity_str = f" | v={detector.last_velocity:.1f} m/s"
 
-    plt.tight_layout()
+    # ========== 1. BG-Subtracted frame ==========
+    ax = axes[0]
+    ax.imshow(result.frame_subtracted, cmap='gray', aspect='auto')
+    ax.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
+    add_position_markers(ax)
+    ax.set_title(f'1. BG Subtracted - Frame {result.frame_idx} | t={result.time_s*1e6:.1f} µs{velocity_str}', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 2. Frame Diff (current - prior) ==========
+    ax = axes[1]
+    if result.frame_diff is not None:
+        vmax = np.percentile(result.frame_diff, 99) if np.any(result.frame_diff > 0) else 1
+        ax.imshow(result.frame_diff, cmap='hot', aspect='auto', vmin=0, vmax=vmax)
+        ax.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
+        add_position_markers(ax)
+    else:
+        ax.text(0.5, 0.5, 'No prior frame', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_facecolor('lightgray')
+    ax.set_title('2. Frame Diff (current - prior)', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 3. Noise Removed (morphological opening) ==========
+    ax = axes[2]
+    if result.noise_removed is not None:
+        vmax = np.percentile(result.noise_removed, 99) if np.any(result.noise_removed > 0) else 1
+        ax.imshow(result.noise_removed, cmap='hot', aspect='auto', vmin=0, vmax=vmax)
+        ax.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
+        add_position_markers(ax)
+    else:
+        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_facecolor('lightgray')
+    ax.set_title('3. Noise Removed (morphological opening)', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 4. Gaussian Blur ==========
+    ax = axes[3]
+    if result.blurred is not None:
+        vmax = np.percentile(result.blurred, 99) if np.any(result.blurred > 0) else 1
+        ax.imshow(result.blurred, cmap='hot', aspect='auto', vmin=0, vmax=vmax)
+        ax.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
+        add_position_markers(ax)
+    else:
+        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_facecolor('lightgray')
+    ax.set_title('4. Gaussian Blur', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 5. Sobel Filter ==========
+    ax = axes[4]
+    if result.sobel_output is not None:
+        vmax = np.percentile(np.abs(result.sobel_output), 99) if np.any(result.sobel_output != 0) else 1
+        ax.imshow(result.sobel_output, cmap='RdBu', aspect='auto', vmin=-vmax, vmax=vmax)
+        ax.axhline(y=center_row, color='black', linestyle='--', linewidth=0.5, alpha=0.5)
+        add_position_markers(ax)
+    else:
+        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_facecolor('lightgray')
+    ax.set_title('5. Sobel Filter (horizontal)', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 6. Gradient Filter ==========
+    ax = axes[5]
+    if result.gradient_output is not None:
+        vmax = np.percentile(np.abs(result.gradient_output), 99) if np.any(result.gradient_output != 0) else 1
+        ax.imshow(result.gradient_output, cmap='RdBu', aspect='auto', vmin=-vmax, vmax=vmax)
+        ax.axhline(y=center_row, color='black', linestyle='--', linewidth=0.5, alpha=0.5)
+        add_position_markers(ax)
+    else:
+        ax.text(0.5, 0.5, 'N/A', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_facecolor('lightgray')
+    ax.set_title('6. Gradient Filter (np.gradient)', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 7. Frame Diff Centerline Profile ==========
+    ax = axes[6]
+    if result.frame_diff is not None:
+        diff_line = result.frame_diff[center_row, :]
+        ax.plot(x_pixels, diff_line, 'r-', linewidth=1.5, label='Frame Diff')
+        ax.fill_between(x_pixels, 0, diff_line, alpha=0.3, color='red')
+    # Add detection markers
+    if result.search_bounds:
+        ax.axvline(x=result.search_bounds[0], color='lime', linestyle='--', linewidth=2, label=f'Search: {result.search_bounds[0]}-{result.search_bounds[1]}')
+        ax.axvline(x=result.search_bounds[1], color='lime', linestyle=':', linewidth=2)
+    if result.pos_min_gradient is not None:
+        ax.axvline(x=result.pos_min_gradient, color='purple', linestyle='-', linewidth=2, label=f'Min Grad: {result.pos_min_gradient}')
+    if result.pos_rightmost_sobel is not None:
+        ax.axvline(x=result.pos_rightmost_sobel, color='orange', linestyle='-', linewidth=2, label=f'R-Sobel: {result.pos_rightmost_sobel}')
+    if result.final_position is not None:
+        ax.axvline(x=result.final_position, color='red', linestyle='-', linewidth=3, label=f'FINAL: {result.final_position}')
+    ax.set_xlim(0, width)
+    ax.set_ylabel('Intensity')
+    ax.set_title('7. Frame Diff Centerline', fontsize=10)
+    ax.legend(loc='upper right', fontsize=8, ncol=3)
+    ax.grid(True, alpha=0.3)
+
+    # ========== 8. Sobel Centerline Profile ==========
+    ax = axes[7]
+    if result.sobel_output is not None:
+        sobel_line = result.sobel_output[center_row, :]
+        ax.plot(x_pixels, sobel_line, 'b-', linewidth=1)
+        ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5)
+    if result.search_bounds:
+        ax.axvline(x=result.search_bounds[0], color='lime', linestyle='--', linewidth=2)
+        ax.axvline(x=result.search_bounds[1], color='lime', linestyle=':', linewidth=2)
+    if result.pos_rightmost_sobel is not None:
+        ax.axvline(x=result.pos_rightmost_sobel, color='orange', linestyle='-', linewidth=2, label=f'Rightmost Sobel: {result.pos_rightmost_sobel}')
+    if result.final_position is not None:
+        ax.axvline(x=result.final_position, color='red', linestyle='-', linewidth=3, label=f'FINAL: {result.final_position}')
+    ax.set_xlim(0, width)
+    ax.set_ylabel('Sobel Value')
+    ax.set_title('8. Sobel Centerline', fontsize=10)
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ========== 9. Gradient Centerline Profile ==========
+    ax = axes[8]
+    if result.gradient_output is not None:
+        gradient_line = result.gradient_output[center_row, :]
+        ax.plot(x_pixels, gradient_line, 'purple', linewidth=1)
+        ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5)
+    if result.search_bounds:
+        ax.axvline(x=result.search_bounds[0], color='lime', linestyle='--', linewidth=2)
+        ax.axvline(x=result.search_bounds[1], color='lime', linestyle=':', linewidth=2)
+    if result.pos_min_gradient is not None:
+        ax.axvline(x=result.pos_min_gradient, color='purple', linestyle='-', linewidth=2, label=f'Min Gradient: {result.pos_min_gradient}')
+    if result.final_position is not None:
+        ax.axvline(x=result.final_position, color='red', linestyle='-', linewidth=3, label=f'FINAL: {result.final_position}')
+    ax.set_xlim(0, width)
+    ax.set_ylabel('Gradient Value')
+    ax.set_title('9. Gradient Centerline (min = leading edge)', fontsize=10)
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ========== 10. Result Overlay ==========
+    ax = axes[9]
+    ax.imshow(result.frame_subtracted, cmap='gray', aspect='auto')
+    ax.axhline(y=center_row, color='cyan', linestyle='--', linewidth=0.5, alpha=0.5)
+    # Show search bounds
+    if result.search_bounds:
+        ax.axvline(x=result.search_bounds[0], color='lime', linestyle='--', linewidth=2, alpha=0.8)
+        ax.axvline(x=result.search_bounds[1], color='lime', linestyle=':', linewidth=2, alpha=0.8)
+    # Show all candidate positions as markers
+    if result.pos_min_gradient is not None:
+        ax.plot(result.pos_min_gradient, center_row, 'p', color='purple', markersize=6, label=f'Min Grad: {result.pos_min_gradient}')
+    if result.pos_rightmost_sobel is not None:
+        ax.plot(result.pos_rightmost_sobel, center_row, 's', color='orange', markersize=6, label=f'R-Sobel: {result.pos_rightmost_sobel}')
+    if result.pos_spline_predicted is not None:
+        ax.plot(result.pos_spline_predicted, center_row, '^', color='cyan', markersize=6, label=f'Spline: {result.pos_spline_predicted}')
+    if result.final_position is not None:
+        ax.plot(result.final_position, center_row, 'o', color='red', markersize=8,
+                markeredgecolor='yellow', markeredgewidth=1, label=f'FINAL: {result.final_position}')
+    ax.legend(loc='upper right', fontsize=8, ncol=2)
+    title_str = f'FINAL: x={result.final_position} px' if result.final_position else 'No detection'
+    ax.set_title(f'10. Result: {title_str}{velocity_str}', fontsize=10)
+    ax.set_ylabel('Y')
+
+    # ========== 11. Position History + Spline ==========
+    ax = axes[10]
+    if detector is not None and len(detector.position_history) > 0:
+        frames_hist = []
+        pos_hist = []
+        for f, p in detector.position_history:
+            if p is not None:
+                frames_hist.append(f)
+                pos_hist.append(p)
+
+        if frames_hist:
+            ax.scatter(frames_hist, pos_hist, c='blue', s=20, alpha=0.7, label='Detected positions', zorder=3)
+
+            # Plot spline curve
+            spline_data = detector.get_spline_curve()
+            if spline_data is not None:
+                spline_frames, spline_pos = spline_data
+                ax.plot(spline_frames, spline_pos, 'g-', linewidth=2, label='Spline estimator', zorder=2)
+
+            # Mark current frame
+            ax.axvline(x=result.frame_idx, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+            if result.final_position is not None:
+                ax.scatter([result.frame_idx], [result.final_position], c='red', s=60,
+                          marker='*', zorder=5, label=f'Current: {result.final_position}')
+            if result.pos_spline_predicted is not None:
+                ax.scatter([result.frame_idx], [result.pos_spline_predicted], c='cyan', s=40,
+                          marker='^', zorder=4, label=f'Spline pred: {result.pos_spline_predicted}')
+
+            ax.legend(loc='upper left', fontsize=8)
+    else:
+        ax.text(0.5, 0.5, 'No history yet', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    ax.set_ylabel('Position (pixels)')
+    ax.set_title('11. Position History + Spline Estimator', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # ========== 12. Velocity History (3 methods) ==========
+    ax = axes[11]
+    if detector is not None and len(detector._velocity_history) > 0:
+        # Velocity history: (frame_idx, v_backward1, v_backward2, v_central)
+        vel_hist = detector._velocity_history
+
+        # Extract data for each method
+        frames = [entry[0] for entry in vel_hist]
+        v_backward1 = [entry[1] for entry in vel_hist]  # First-order backward
+        v_backward2 = [entry[2] for entry in vel_hist if entry[2] is not None]  # Second-order backward
+        frames_b2 = [entry[0] for entry in vel_hist if entry[2] is not None]
+        v_central = [entry[3] for entry in vel_hist if entry[3] is not None]  # Central difference
+        frames_central = [entry[0] for entry in vel_hist if entry[3] is not None]
+
+        if frames:
+            # Plot all three velocity methods with different colors/styles
+            ax.plot(frames, v_backward1, 'b-', linewidth=1.5, alpha=0.8,
+                   label='1st-order backward')
+            if frames_b2 and v_backward2:
+                ax.plot(frames_b2, v_backward2, 'g--', linewidth=1.5, alpha=0.8,
+                       label='2nd-order backward')
+            if frames_central and v_central:
+                ax.plot(frames_central, v_central, 'r:', linewidth=2, alpha=0.8,
+                       label='2nd-order central')
+
+            ax.axhline(y=0, color='gray', linestyle='-', linewidth=0.5)
+
+            # Mark DDT if detected
+            if detector.ddt_detected:
+                ax.axvline(x=detector.ddt_frame, color='magenta', linestyle='--', linewidth=2,
+                          label=f'DDT @ frame {detector.ddt_frame}')
+
+            # Mark current velocities
+            v1, v2, vc = detector.last_velocities
+            legend_str = f'Current: B1={v1:.0f}' if v1 else 'Current: N/A'
+            if v2 is not None:
+                legend_str += f', B2={v2:.0f}'
+            ax.scatter([result.frame_idx], [v1] if v1 else [], c='blue', s=40,
+                      marker='*', zorder=5)
+
+            ax.legend(loc='upper left', fontsize=7)
+    else:
+        ax.text(0.5, 0.5, 'No velocity data yet', ha='center', va='center', transform=ax.transAxes, fontsize=12)
+    ax.set_xlabel('Frame Index')
+    ax.set_ylabel('Velocity (m/s)')
+    ddt_str = f' | DDT @ {detector.ddt_frame}' if detector is not None and detector.ddt_detected else ''
+    ax.set_title(f'12. Velocity Comparison{ddt_str}', fontsize=10)
+    ax.grid(True, alpha=0.3)
 
     # Save figure
-    output_file = output_path / f"{source_name}-Frame-{frame_idx:06d}.png"
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    output_file = output_path / f"{source_name}-Frame-{result.frame_idx:06d}.png"
+    plt.savefig(output_file, dpi=120, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -691,10 +1114,8 @@ def generate_stacked_sequence(
     output_path: Path,
     title: str = "",
     show_frame_diff: bool = True,
-    show_tracking: bool = True,
-    detection_threshold: float = 5.0,
     figsize_width: float = 10.0
-) -> List[Tuple[int, Optional[int]]]:
+) -> None:
     """
     Generate stacked frame sequence image (paper-style visualization).
 
@@ -708,16 +1129,10 @@ def generate_stacked_sequence(
         output_path: Path to save the output image
         title: Optional title for the figure
         show_frame_diff: If True, show two columns (original + processed)
-        show_tracking: If True, show flame position markers
-        detection_threshold: Threshold for flame detection on frame difference
         figsize_width: Width of the figure in inches
-
-    Returns:
-        List of (frame_idx, flame_position) tuples
     """
     n_frames = len(frame_indices)
     height, width = video.frame_shape
-    center_row = height // 2
 
     # Determine number of columns
     n_cols = 2 if show_frame_diff else 1
@@ -734,7 +1149,6 @@ def generate_stacked_sequence(
         axes = axes.reshape(-1, 1)
 
     prior_frame = None
-    tracking_results = []
 
     for i, frame_idx in enumerate(frame_indices):
         frame = video[frame_idx]
@@ -746,35 +1160,17 @@ def generate_stacked_sequence(
         else:
             frame_diff = np.zeros_like(frame)
 
-        # Detect flame position on FRAME DIFFERENCE
-        if prior_frame is not None:
-            flame_pos = detect_rightmost_flame_edge(frame_diff[center_row, :], threshold=detection_threshold)
-        else:
-            flame_pos = None
-
-        tracking_results.append((frame_idx, flame_pos))
-
         # Column 1: Background subtracted
         axes[i, 0].imshow(frame_subtracted, cmap='gray', aspect='equal', vmin=0)
         axes[i, 0].set_ylabel(f'{i+1}', rotation=0, labelpad=20, fontsize=10, fontweight='bold', color='white')
         axes[i, 0].set_xticks([])
         axes[i, 0].set_yticks([])
 
-        # Show tracking marker on BG subtracted
-        if show_tracking and flame_pos is not None:
-            axes[i, 0].plot(flame_pos, center_row, 'ro', markersize=4, markeredgecolor='yellow', markeredgewidth=0.5)
-            axes[i, 0].axhline(y=center_row, color='cyan', linewidth=0.3, alpha=0.3)
-
         # Column 2: Frame difference (if enabled)
         if n_cols > 1:
             axes[i, 1].imshow(frame_diff, cmap='gray', aspect='equal', vmin=0)
             axes[i, 1].set_xticks([])
             axes[i, 1].set_yticks([])
-
-            # Show tracking marker on frame diff
-            if show_tracking and flame_pos is not None:
-                axes[i, 1].plot(flame_pos, center_row, 'ro', markersize=4, markeredgecolor='yellow', markeredgewidth=0.5)
-                axes[i, 1].axhline(y=center_row, color='cyan', linewidth=0.3, alpha=0.3)
 
         prior_frame = frame.copy()
 
@@ -789,8 +1185,6 @@ def generate_stacked_sequence(
     plt.close(fig)
     print(f"Saved stacked sequence: {output_path}")
 
-    return tracking_results
-
 
 def generate_stacked_sequence_single_column(
     video,
@@ -798,11 +1192,9 @@ def generate_stacked_sequence_single_column(
     background_scalar: float,
     output_path: Path,
     use_frame_diff: bool = False,
-    show_tracking: bool = True,
-    detection_threshold: float = 5.0,
     title: str = "",
     figsize_width: float = 6.0
-) -> List[Tuple[int, Optional[int]]]:
+) -> None:
     """
     Generate single-column stacked frame sequence (compact paper-style).
 
@@ -812,13 +1204,8 @@ def generate_stacked_sequence_single_column(
         background_scalar: Background value for subtraction
         output_path: Path to save the output image
         use_frame_diff: If True, show frame difference instead of BG subtracted
-        show_tracking: If True, show flame position markers (detected on frame diff)
-        detection_threshold: Threshold for flame detection
         title: Optional title
         figsize_width: Width of figure
-
-    Returns:
-        List of (frame_idx, flame_position) tuples
     """
     n_frames = len(frame_indices)
     height, width = video.frame_shape
@@ -829,22 +1216,16 @@ def generate_stacked_sequence_single_column(
     stacked_image = np.zeros((stacked_height, width), dtype=np.float64)
 
     prior_frame = None
-    tracking_results = []
 
     for i, frame_idx in enumerate(frame_indices):
         frame = video[frame_idx]
         frame_subtracted = subtract_scalar_background(frame, background_scalar)
 
-        # Compute frame difference for tracking
+        # Compute frame difference
         if prior_frame is not None:
             frame_diff = subtract_prior_frame(frame, prior_frame, threshold=0.0)
-            # Detect flame on frame difference
-            flame_pos = detect_rightmost_flame_edge(frame_diff[center_row, :], threshold=detection_threshold)
         else:
             frame_diff = np.zeros_like(frame)
-            flame_pos = None
-
-        tracking_results.append((frame_idx, flame_pos))
 
         # Choose display frame
         if use_frame_diff:
@@ -866,8 +1247,8 @@ def generate_stacked_sequence_single_column(
     fig, ax = plt.subplots(figsize=(figsize_width, fig_height))
     ax.imshow(stacked_image, cmap='gray', aspect='equal', vmin=0)
 
-    # Add frame numbers, separator lines, and tracking markers
-    for i, (frame_idx, flame_pos) in enumerate(zip(frame_indices, [r[1] for r in tracking_results])):
+    # Add frame numbers and separator lines
+    for i, frame_idx in enumerate(frame_indices):
         y_center = i * height + center_row
         ax.text(-width * 0.02, y_center, f'{i+1}', color='white', fontsize=8,
                 fontweight='bold', ha='right', va='center')
@@ -875,10 +1256,6 @@ def generate_stacked_sequence_single_column(
         # Horizontal separator line
         if i > 0:
             ax.axhline(y=i * height - 0.5, color='white', linewidth=0.5, alpha=0.5)
-
-        # Flame tracking marker
-        if show_tracking and flame_pos is not None:
-            ax.plot(flame_pos, y_center, 'ro', markersize=3, markeredgecolor='yellow', markeredgewidth=0.5)
 
     ax.set_xlim(-width * 0.05, width)
     ax.set_xticks([])
@@ -891,8 +1268,6 @@ def generate_stacked_sequence_single_column(
     plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='black', edgecolor='none')
     plt.close(fig)
     print(f"Saved stacked sequence: {output_path}")
-
-    return tracking_results
 
 
 ########################################################################################################################
@@ -1038,13 +1413,21 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
                 figsize_width=8.0
             )
 
-        # Process frames
-        results = {
-            '#Frame': [],
-            'Time_s': [],
-            'Position_px': [],
-            'Position_m': [],
-        }
+        # Create flame detector instance
+        detector_config = FlameDetectorConfig(
+            gaussian_sigma=1.5,
+            morphology_kernel_size=3,
+            max_velocity_change_m_s=200.0,
+        )
+        flame_detector = FlameDetector(
+            config=detector_config,
+            frame_rate=video.frame_rate,
+            calibration_m_per_px=file_calibration
+        )
+
+        if is_root:
+            print(f"  Flame detector configured: max_velocity={detector_config.max_velocity_change_m_s} m/s")
+            print(f"  Max displacement per frame: {flame_detector._max_displacement_px} px")
 
         # Determine frame indices to process
         if processor is not None:
@@ -1052,15 +1435,11 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
         else:
             frame_indices = list(range(len(video)))
 
-        local_results = []
-        flame_exited = False
-
-        prior_frame = None
-        prior_flame_pos = None  # Track previous flame position for velocity check
         empty_frame_count = 0
+        local_results = []
 
         for frame_idx in frame_indices:
-            # Skip explicitly configured frames (e.g., no centerline flame detection)
+            # Skip explicitly configured frames
             if frame_idx in config.skip_frames:
                 print(f"[Rank {rank}] Skipping frame {frame_idx} (in skip_frames list)")
                 continue
@@ -1079,92 +1458,73 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
             noise_thresh = max(10.0, background_scalar * 0.5)
             if is_empty_frame(frame_subtracted, noise_threshold=noise_thresh, min_signal_fraction=0.0005):
                 empty_frame_count += 1
-                prior_frame = frame.copy()
+                # Update detector's prior frame even for empty frames
+                flame_detector._prior_frame = frame_subtracted.copy()
                 continue
 
-            # Compute frame difference (prior frame subtraction) for motion detection
-            if prior_frame is not None:
-                frame_diff = subtract_prior_frame(frame, prior_frame, threshold=5.0)
-            else:
-                frame_diff = None
-
-            # Check if centerline has flame signal above noise threshold (from frame 0)
-            # This determines if there's meaningful flame at the center before attempting detection
-            current_centerline = frame_subtracted[center_row, :]
-            centerline_max_intensity = np.max(current_centerline)
-            has_centerline_flame = centerline_max_intensity > centerline_flame_threshold
-
-            # Automatic skip: if no flame along centerline and tracking hasn't started yet,
-            # skip this frame entirely without updating prior_frame
-            if not has_centerline_flame and prior_flame_pos is None:
-                print(f"[Rank {rank}] Skipping frame {frame_idx} (centerline max={centerline_max_intensity:.1f} < threshold={centerline_flame_threshold:.1f})")
-                continue
-
-            # Detect flame edge on the DIFFERENCE IMAGE (motion-based detection)
-            # This isolates the moving flame front from static background
-            if frame_diff is not None:
-                pixel_pos = detect_flame_edge(
-                    frame_diff[center_row, :],
-                    method=config.detection_method
-                )
-            else:
-                # First frame - no prior available, skip detection
-                pixel_pos = None
-
-            # Enforce non-negative velocity: flame can only move forward (increasing x)
-            if pixel_pos is not None and prior_flame_pos is not None:
-                if pixel_pos < prior_flame_pos:
-                    # Reject detection - flame cannot move backwards
-                    # Use prior position as current (flame is at least where it was)
-                    pixel_pos = None
-
-            # Check for flame exiting domain
-            # Simple check: if detected position reaches the end of the domain, flame has left
-            domain_end_threshold = video.width - 10  # Last 10 pixels
-
-            if pixel_pos is not None and pixel_pos >= domain_end_threshold:
-                print(f"[Rank {rank}] *** FLAME EXITED *** at frame {frame_idx}")
-                print(f"  pixel_pos={pixel_pos} >= {domain_end_threshold} (width={video.width})")
-
-                # Record final position and stop
-                pos_m = pixel_pos * file_calibration + file_position_offset
-                local_results.append((frame_idx, time_s, pixel_pos, pos_m))
-
-                # Save this final frame
-                save_frame_image(
-                    frame=frame,
-                    frame_subtracted=frame_subtracted,
-                    frame_diff=frame_diff,
-                    flame_position=pixel_pos,
-                    frame_idx=frame_idx,
-                    time_s=time_s,
-                    output_path=frames_output_dir,
-                    source_name=config.name
-                )
-                break  # EXIT THE LOOP
-
-            if pixel_pos is not None:
-                pos_m = pixel_pos * file_calibration + file_position_offset
-                local_results.append((frame_idx, time_s, pixel_pos, pos_m))
-                prior_flame_pos = pixel_pos  # Update for next iteration
-
-            # Save frame image
-            save_frame_image(
+            # Detect flame position using the FlameDetector
+            # Returns FlameDetectionResult with all intermediate outputs
+            detection_result = flame_detector.detect(
                 frame=frame,
-                frame_subtracted=frame_subtracted,
-                frame_diff=frame_diff,
-                flame_position=pixel_pos,
                 frame_idx=frame_idx,
-                time_s=time_s,
-                output_path=frames_output_dir,
-                source_name=config.name
+                background_scalar=background_scalar
             )
 
-            # Store current frame as prior for next iteration
-            prior_frame = frame.copy()
+            # Save frame image with all processing steps
+            save_frame_image(
+                frame=frame,
+                result=detection_result,
+                output_path=frames_output_dir,
+                source_name=config.name,
+                detector=flame_detector
+            )
+
+            # Collect results for output
+            flame_position = detection_result.final_position
+            velocity = flame_detector.last_velocity
+
+            # Check for flame exiting domain BEFORE recording
+            # This prevents recording frames where the flame is at the edge with artificially low velocity
+            exit_margin = detector_config.exit_margin_px
+            if flame_position is not None and flame_position >= video.width - exit_margin:
+                # Clear the central difference from previous frame - it used this bad position
+                flame_detector.clear_last_central_difference()
+                if is_root:
+                    print(f"  Wave exited domain at frame {frame_idx}, position {flame_position} px (not recorded)")
+                break
+
+            # Check for sudden velocity drop (>50% decrease) - indicates edge artifact
+            # This catches cases where position hasn't quite reached the margin but velocity drops
+            # Use first-order backward velocity (v1) for this check
+            vel_history = flame_detector.get_velocity_history()
+            if velocity is not None and len(vel_history) >= 2:
+                prev_v1 = vel_history[-2][1]  # v1 (first-order backward) from previous frame
+                if prev_v1 is not None and prev_v1 > 100:  # Only check if we had substantial velocity
+                    velocity_drop_ratio = (prev_v1 - velocity) / prev_v1
+                    if velocity_drop_ratio > 0.5:  # More than 50% drop
+                        # Clear the central difference from previous frame - it used this bad position
+                        flame_detector.clear_last_central_difference()
+                        if is_root:
+                            print(f"  Velocity drop detected at frame {frame_idx}: {prev_v1:.1f} -> {velocity:.1f} m/s (not recorded)")
+                        break
+
+            if flame_position is not None:
+                pos_m = flame_position * file_calibration + file_position_offset
+                is_post_ddt = flame_detector.ddt_detected and frame_idx >= flame_detector.ddt_frame
+                # Store position data only - velocities will be merged from velocity_history later
+                # This ensures v_central is properly filled in (it's computed one frame later)
+                local_results.append((frame_idx, time_s, flame_position, pos_m, is_post_ddt))
+
+            # Report DDT detection
+            if flame_detector.ddt_detected and flame_detector.ddt_frame == frame_idx:
+                if is_root:
+                    vel_str = f"{velocity:.1f}" if velocity is not None else "N/A"
+                    print(f"  *** DDT DETECTED at frame {frame_idx}, velocity jump to {vel_str} m/s ***")
 
             if frame_idx % 50 == 0:
-                print(f"[Rank {rank}] Processed frame {frame_idx}/{len(video)} (skipped {empty_frame_count} empty)")
+                pos_str = f"{flame_position} px" if flame_position else "None"
+                ddt_str = " [POST-DDT]" if flame_detector.ddt_detected else ""
+                print(f"[Rank {rank}] Frame {frame_idx}/{len(video)}, position={pos_str}{ddt_str} (skipped {empty_frame_count} empty)")
 
         if is_root:
             print(f"  Skipped {empty_frame_count} empty/noise-only frames")
@@ -1173,7 +1533,6 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
         if processor is not None:
             all_results = processor.gather(local_results)
             if is_root:
-                # Flatten and sort
                 flat_results = [item for sublist in all_results for item in sublist]
                 flat_results.sort(key=lambda x: x[0])
             else:
@@ -1183,56 +1542,92 @@ def process_video_source(config: VideoSourceConfig, processor: Optional[MPIVideo
 
         # Write results (root only)
         if is_root and flat_results:
-            # Post-process: truncate results after flame exits domain
-            # This handles MPI case where different ranks may process frames past exit
-            domain_end_threshold = video.width - 10
-            exit_frame_idx = None
+            # Merge position data with velocity history
+            # Results format from loop: (frame, time, px, m, is_post_ddt)
+            # Velocity history format: (frame_idx, v1, v2, v_central)
+            vel_dict = {entry[0]: (entry[1], entry[2], entry[3])
+                       for entry in flame_detector.get_velocity_history()}
 
-            for i, (frame_idx, time_s, pixel_pos, pos_m) in enumerate(flat_results):
-                if pixel_pos >= domain_end_threshold:
-                    exit_frame_idx = i
-                    print(f"  Flame exited at frame {frame_idx} (position {pixel_pos} >= {domain_end_threshold})")
-                    break
+            # Merge velocities into results
+            merged_results = []
+            for f, t, px, m, is_post in flat_results:
+                v1, v2, vc = vel_dict.get(f, (None, None, None))
+                merged_results.append((f, t, px, m, v1, v2, vc, is_post))
 
-            # Truncate results to include only up to and including the exit frame
-            if exit_frame_idx is not None:
-                # Get the exit frame number to clean up images
-                exit_frame_num = flat_results[exit_frame_idx][0]
+            # Split results by pre-DDT and post-DDT
+            pre_ddt_results = [(f, t, px, m, v1, v2, vc) for f, t, px, m, v1, v2, vc, is_post in merged_results if not is_post]
+            post_ddt_results = [(f, t, px, m, v1, v2, vc) for f, t, px, m, v1, v2, vc, is_post in merged_results if is_post]
 
-                flat_results = flat_results[:exit_frame_idx + 1]
-                print(f"  Truncated results to {len(flat_results)} frames (removed frames after exit)")
+            def write_position_results(data, filepath, label):
+                """Helper to write position results to file with all velocity methods."""
+                # Header describing velocity extraction methods
+                header_lines = [
+                    "# Flame Position and Velocity Data",
+                    "#",
+                    "# Velocity Extraction Methods:",
+                    "#   Vel_Backward1: First-order backward difference",
+                    "#                  v_n = (x_n - x_{n-1}) / dt",
+                    "#                  Evaluates velocity at current time step",
+                    "#",
+                    "#   Vel_Backward2: Second-order backward difference",
+                    "#                  v_n = (3*x_n - 4*x_{n-1} + x_{n-2}) / (2*dt)",
+                    "#                  Higher accuracy at current time, requires 3 points",
+                    "#",
+                    "#   Vel_Central:   Second-order central difference",
+                    "#                  v_{n-1} = (x_n - x_{n-2}) / (2*dt)",
+                    "#                  Most accurate, but evaluates at PRIOR time step",
+                    "#",
+                ]
 
-                # Delete frame images past the exit frame
-                import glob
-                frame_pattern = str(frames_output_dir / f"{config.name}-Frame-*.png")
-                all_frame_images = glob.glob(frame_pattern)
-                deleted_count = 0
-                for img_path in all_frame_images:
-                    # Extract frame number from filename (e.g., "Nova-Frame-000144.png" -> 144)
-                    try:
-                        fname = os.path.basename(img_path)
-                        frame_num = int(fname.split('-Frame-')[1].split('.')[0])
-                        if frame_num > exit_frame_num:
-                            os.remove(img_path)
-                            deleted_count += 1
-                    except (ValueError, IndexError):
-                        pass
-                if deleted_count > 0:
-                    print(f"  Deleted {deleted_count} frame images past exit frame {exit_frame_num}")
+                with open(filepath, 'w') as f:
+                    # Write header
+                    for line in header_lines:
+                        f.write(line + '\n')
 
-            for frame_idx, time_s, pixel_pos, pos_m in flat_results:
-                results['#Frame'].append(frame_idx)
-                results['Time_s'].append(f"{time_s:.9f}")
-                results['Position_px'].append(pixel_pos)
-                results['Position_m'].append(f"{pos_m:.9f}")
+                    # Write column headers and data
+                    columns = ['#Frame', 'Time_s', 'Position_px', 'Position_m',
+                              'Vel_Backward1', 'Vel_Backward2', 'Vel_Central']
+                    f.write(' '.join(columns) + '\n')
 
-            # Write results file
-            output_file = output_dir / f"{cihx_file.stem}-flame-position.txt"
-            write_results(results, str(output_file))
-            print(f"\nResults saved to: {output_file}")
-            print(f"  Total frames processed: {len(flat_results)}")
+                    for f_idx, t_s, pixel_pos, p_m, v1, v2, vc in data:
+                        row = [
+                            str(f_idx),
+                            f"{t_s:.9f}",
+                            str(pixel_pos),
+                            f"{p_m:.9f}",
+                            f"{v1:.3f}" if v1 is not None else "",
+                            f"{v2:.3f}" if v2 is not None else "",
+                            f"{vc:.3f}" if vc is not None else "",
+                        ]
+                        f.write(' '.join(row) + '\n')
+
+                print(f"  {label}: {filepath} ({len(data)} points)")
+
+            # Write all results
+            output_file_all = output_dir / f"{cihx_file.stem}-flame-position.txt"
+            all_data = [(f, t, px, m, v1, v2, vc) for f, t, px, m, v1, v2, vc, _ in merged_results]
+            write_position_results(all_data, output_file_all, "All results")
+
+            # Write pre-DDT results
+            if pre_ddt_results:
+                output_file_pre = output_dir / f"{cihx_file.stem}-flame-position-pre-DDT.txt"
+                write_position_results(pre_ddt_results, output_file_pre, "Pre-DDT")
+
+            # Write post-DDT results
+            if post_ddt_results:
+                output_file_post = output_dir / f"{cihx_file.stem}-flame-position-post-DDT.txt"
+                write_position_results(post_ddt_results, output_file_post, "Post-DDT")
+
+            # Summary
+            print(f"\nResults summary:")
+            print(f"  Total detections: {len(flat_results)}")
+            print(f"  Pre-DDT: {len(pre_ddt_results)}, Post-DDT: {len(post_ddt_results)}")
+            if flame_detector.ddt_detected:
+                print(f"  DDT detected at frame {flame_detector.ddt_frame}")
+            print(f"  Frame images saved to: {frames_output_dir}")
 
         video.close()
+
 
 
 def main():
@@ -1250,16 +1645,14 @@ def main():
     # Configure video sources
     nova_config = VideoSourceConfig(name="Nova")
     nova_config.enabled = True
-    nova_config.use_frame_diff = True  # Enable prior frame subtraction for flame isolation
-    nova_config.detection_method = "half_maximum"  # Options: "threshold", "gradient", "half_maximum"
+    nova_config.use_frame_diff = True  # Enable prior frame subtraction for visualization
     nova_config.use_absolute_time = True  # Use absolute time from recording start
     nova_config.video_path = "./Nova-Video-Files"
     nova_config.output_dir = "./Processed-Photos/Nova-Output"
 
     mini_config = VideoSourceConfig(name="Mini")
     mini_config.enabled = True
-    mini_config.use_frame_diff = True  # Enable prior frame subtraction for flame isolation
-    mini_config.detection_method = "threshold"  # Use threshold for Mini - half_max fails due to strong signal behind flame
+    mini_config.use_frame_diff = True  # Enable prior frame subtraction for visualization
     mini_config.use_absolute_time = True  # Use absolute time from recording start
     mini_config.video_path = "./Mini-Video-Files"
     mini_config.output_dir = "./Processed-Photos/Mini-Output"
